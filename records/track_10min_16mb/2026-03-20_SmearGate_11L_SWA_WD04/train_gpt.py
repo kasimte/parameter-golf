@@ -102,7 +102,7 @@ class Hyperparameters:
     swa_every = int(os.environ.get("SWA_EVERY", 200))
 
     # BigramHash: inject token-pair context via a hash-table embedding.
-    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 2048))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
 
     # SmearGate: blend each token's embedding with the previous token's
