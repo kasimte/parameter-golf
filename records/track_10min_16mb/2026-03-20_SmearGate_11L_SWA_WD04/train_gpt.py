@@ -1,8 +1,4 @@
-"""
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
-
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
-"""
+"""train_gpt.py — v3 submission: 11L/EMA/XSA/PartialRoPE/LNScale/LateQAT/TTT."""
 
 from __future__ import annotations
 
@@ -33,17 +29,9 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# -----------------------------
-# HYPERPARAMETERS
-# -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# --- HYPERPARAMETERS ---
 
 class Hyperparameters:
-    # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
@@ -51,25 +39,20 @@ class Hyperparameters:
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
-    # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    # Sliding window eval: stride controls how many tokens to slide between windows.
-    # Only the last `eval_stride` tokens per window are scored, giving each scored token
-    # (seq_len - eval_stride) tokens of context. Set to 0 to disable (use standard eval).
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -80,7 +63,6 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
@@ -103,24 +85,37 @@ class Hyperparameters:
     # XSA: exclusive self-attention on last N layers (0 = disabled).
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
 
+    # Partial RoPE: only apply rotary embeddings to first N dims of each head.
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+
+    # LN Scale: damp deeper layers' normalized activations by 1/sqrt(layer_idx+1).
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
+
+    # Late QAT: enable int6 STE fake-quantization only in final warmdown.
+    late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
+    qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.1))
+
+    # TTT: full-weight SGD adaptation on val data after quantization.
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
+
+    adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.04))
+
     # BigramHash: inject token-pair context via a hash-table embedding.
-    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 2048))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
 
     # SmearGate: blend each token's embedding with the previous token's
     # via a tiny learned gate. Injects bigram context before the transformer.
     use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "1")))
 
-# -----------------------------
-# MUON OPTIMIZER 
-# -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
+# --- MUON OPTIMIZER (from modded-nanogpt) ---
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -162,11 +157,6 @@ class Muon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
             wd = group["weight_decay"]
 
-            # Decoupled weight decay: shrink weights toward zero before the
-            # gradient update.  This keeps the weight distribution tight and
-            # well-centred, which (a) improves generalisation and (b) makes
-            # post-training int6 quantisation compress better — the tighter
-            # distribution fits into fewer quantisation buckets with less error.
             if wd > 0:
                 for p in params:
                     p.mul_(1.0 - wd * lr)
@@ -186,7 +176,6 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
@@ -203,14 +192,7 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-# -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
-# -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
+# --- TOKENIZER-AGNOSTIC EVALUATION ---
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -252,20 +234,10 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
 
 
 def eval_val(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
+    args: Hyperparameters, model: nn.Module, rank: int, world_size: int,
+    device: torch.device, grad_accum_steps: int, val_tokens: Tensor,
+    base_bytes_lut: Tensor, has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -314,31 +286,14 @@ def eval_val(
 
 
 def eval_val_sliding_window(
-    args: Hyperparameters,
-    base_model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    stride: int = 64,
+    args: Hyperparameters, base_model: nn.Module, rank: int, world_size: int,
+    device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor, stride: int = 64,
 ) -> tuple[float, float]:
-    """Sliding window evaluation: each scored token gets (seq_len - stride) context.
-
-    Instead of chopping validation into non-overlapping 1024-token blocks (where
-    the first token in each block gets zero context), we slide a 1024-token window
-    by `stride` tokens at a time and only score the last `stride` tokens per window.
-    Every scored token sees 960+ tokens of context, dramatically improving BPB.
-    """
+    """Sliding window eval: each scored token gets (seq_len - stride) context."""
     seq_len = args.train_seq_len
-    total_tokens = val_tokens.numel() - 1  # need 1 extra for final target
-
-    # Number of windows: first window at offset 0, then slide by stride
+    total_tokens = val_tokens.numel() - 1
     num_windows = max((total_tokens - seq_len) // stride + 1, 1)
-
-    # Distribute windows across ranks
     win_start = (num_windows * rank) // world_size
     win_end = (num_windows * (rank + 1)) // world_size
 
@@ -346,7 +301,6 @@ def eval_val_sliding_window(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    # Eval batch: how many windows per forward pass. Tune for memory.
     eval_batch = int(os.environ.get("SW_EVAL_BATCH", 32))
 
     base_model.eval()
@@ -356,38 +310,25 @@ def eval_val_sliding_window(
         for batch_idx in range(num_batches):
             batch_wins = window_list[batch_idx * eval_batch : (batch_idx + 1) * eval_batch]
             bsz = len(batch_wins)
-
-            # Build input: each window is val_tokens[w*stride : w*stride + seq_len]
             inputs = torch.stack([
                 val_tokens[w * stride : w * stride + seq_len]
                 for w in batch_wins
-            ]).to(device=device, dtype=torch.int64)  # [B, seq_len]
-
+            ]).to(device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = base_model.forward_logits(inputs)  # [B, seq_len, vocab]
-
-            # Score only the last `stride` positions per window.
-            # logits[:, j, :] predicts the token AFTER position j in the input.
-            # So logits[:, -stride:, :] predicts tokens at input positions
-            # [seq_len - stride + 1, seq_len + 1) — which are the targets.
-            scored_logits = logits[:, -stride:, :].reshape(-1, logits.size(-1))  # [B*stride, vocab]
-
-            # Build targets: for window w, targets are val_tokens[w*stride + seq_len - stride + 1 : w*stride + seq_len + 1]
+                logits = base_model.forward_logits(inputs)
+            scored_logits = logits[:, -stride:, :].reshape(-1, logits.size(-1))
             targets = torch.stack([
                 val_tokens[w * stride + seq_len - stride + 1 : w * stride + seq_len + 1]
                 for w in batch_wins
-            ]).to(device=device, dtype=torch.int64).reshape(-1)  # [B*stride]
-
+            ]).to(device=device, dtype=torch.int64).reshape(-1)
             loss = F.cross_entropy(scored_logits.float(), targets, reduction="sum")
             val_loss_sum += loss.to(torch.float64)
             val_token_count += float(targets.numel())
 
-            # BPB: prev_ids are the input tokens at each scored position
             prev_ids = torch.stack([
                 val_tokens[w * stride + seq_len - stride : w * stride + seq_len]
                 for w in batch_wins
-            ]).to(device=device, dtype=torch.int64).reshape(-1)  # [B*stride]
-
+            ]).to(device=device, dtype=torch.int64).reshape(-1)
             tgt_ids = targets
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
@@ -407,13 +348,7 @@ def eval_val_sliding_window(
     base_model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
-# -----------------------------
-# POST-TRAINING QUANTIZATION
-# -----------------------------
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
+# --- POST-TRAINING QUANTIZATION ---
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -435,11 +370,8 @@ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 
-INT6_QUANT_RANGE = 31  # int6: [-31, 31]
+INT6_QUANT_RANGE = 31
 INT6_CLIP_Q = 0.9999984
-
-# Tensors matching these patterns are stored as fp16 passthrough (not quantized).
-# For weights without STE fake-quant protection (e.g. nn.Embedding, bigram hash table).
 FP16_PASSTHROUGH_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -463,8 +395,6 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Int6 per-row quantization: [-31, 31] range stored in int8 containers.
-        # The unused high bits compress extremely well with zstd.
         clip_abs = (
             torch.quantile(t32.abs(), INT6_CLIP_Q, dim=1)
             if t32.numel()
@@ -475,18 +405,12 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
         q = torch.clamp(torch.round(clipped / scale[:, None]), -INT6_QUANT_RANGE, INT6_QUANT_RANGE).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-    # Vectors / scalars still use int8 per-tensor scale (they're tiny).
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT6_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -509,9 +433,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             passthrough[name] = t
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
@@ -519,7 +440,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        # fp16 passthrough for tensors without STE protection (tok_emb, bigram_hash).
         if any(pattern in name for pattern in FP16_PASSTHROUGH_PATTERNS):
             passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
             kept = t.to(dtype=torch.float16).contiguous()
@@ -562,7 +482,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -571,15 +490,12 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-# -----------------------------
-# DATA LOADING 
-# -----------------------------
+# --- DATA LOADING ---
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
     header = np.fromfile(file, dtype="<i4", count=256)
-    # SHARD HEADER INTS & SHARD_MAGIC
     if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
         raise ValueError(f"Unexpected shard header for {file}")
     num_tokens = int(header[2])
@@ -593,8 +509,6 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
@@ -624,8 +538,6 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -642,9 +554,7 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-# -----------------------------
-# TRANSFORMER MODULES
-# -----------------------------
+# --- TRANSFORMER MODULES ---
 
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
@@ -656,27 +566,29 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # During training, apply fake int6 quantization (STE) so the model learns to be robust
-    # to the post-training quantization that will be applied for the 16MB artifact.
+    _qat_enabled: bool = False
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
-        if self.training and w.ndim == 2:
-            # Fake int6 per-row quantization with Straight-Through Estimator:
-            # Forward uses quantized weights, backward passes gradients through as-is.
+        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
+            with torch.no_grad():
+                w32 = self.weight.float()
+                row_max = w32.abs().amax(dim=1)
+                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -31, 31) * scale[:, None]).to(x.dtype)
+            w = w + (w_q - w).detach()
+        if self.training and w.ndim == 2 and not CastedLinear._qat_enabled:
             with torch.no_grad():
                 w32 = w.float()
                 clip_abs = torch.quantile(w32.abs(), INT6_CLIP_Q, dim=1).clamp_min(1e-8)
                 scale = clip_abs / INT6_QUANT_RANGE
                 w_clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
                 w_q = (torch.round(w_clipped / scale[:, None]) * scale[:, None]).to(x.dtype)
-            w = w + (w_q - w).detach()  # STE: value of w_q, gradient of w
+            w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
@@ -684,10 +596,11 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, base: float = 10000.0, rope_dims: int = 0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.rope_dims = rope_dims if rope_dims > 0 else dim
+        rd = self.rope_dims
+        inv_freq = 1.0 / (base ** (torch.arange(0, rd, 2, dtype=torch.float32) / rd))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -709,9 +622,16 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    rd = cos.size(-1) * 2
+    if rd < x.size(-1):
+        x_rope, x_pass = x[..., :rd], x[..., rd:]
+        half = rd // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        x_rot = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+        return torch.cat((x_rot, x_pass), dim=-1)
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -722,6 +642,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -740,17 +661,16 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=rope_dims)
         self.use_xsa = False
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
-        """Subtract self-value projection via GQA-aware reshape (no repeat_interleave).
-        y: (B, H, T, D), v: (B, Hkv, T, D) — both in (B, H, T, D) layout."""
+        """Subtract self-value projection via GQA-aware reshape."""
         B, H, T, D = y.shape
         Hkv = v.size(1)
         group = H // Hkv
         y_g = y.reshape(B, Hkv, group, T, D)
-        vn = F.normalize(v, dim=-1).unsqueeze(2)  # (B, Hkv, 1, T, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(2)
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, H, T, D)
 
@@ -780,7 +700,6 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
@@ -802,22 +721,26 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
+        layer_idx: int = 0,
+        ln_scale: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x) * self.ln_scale_factor)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * self.ln_scale_factor)
         return x
 
 
@@ -842,20 +765,9 @@ class BigramHash(nn.Module):
 
 
 class SmearGate(nn.Module):
-    """Learned per-dimension gate blending each token's embedding with the
-    previous token's.  Injects bigram (two-token) context directly into the
-    embedding layer *before* the transformer starts processing.
-
-    Normally a transformer must discover token-pair relationships through
-    self-attention; SmearGate provides this signal for free at ~dim params.
-
-    Technique originated by @unnir in parameter-golf PR #102/#135.
-    """
+    """Blend each token's embedding with previous token via learned gate."""
     def __init__(self, dim: int):
         super().__init__()
-        # Initialise so sigmoid(gate) ≈ 0.95 → mostly pass-through at init,
-        # with a small amount of previous-token blending that the model can
-        # learn to increase or decrease per dimension.
         self.gate = nn.Parameter(torch.full((dim,), 3.0, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
@@ -882,6 +794,8 @@ class GPT(nn.Module):
         bigram_hash_dim: int = 128,
         use_smeargate: bool = True,
         xsa_last_n: int = 0,
+        rope_dims: int = 0,
+        ln_scale: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -905,6 +819,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    rope_dims=rope_dims,
+                    layer_idx=i,
+                    ln_scale=ln_scale,
                 )
                 for i in range(num_layers)
             ]
@@ -914,7 +831,6 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
-        # Enable XSA on last N layers
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
@@ -927,12 +843,6 @@ class GPT(nn.Module):
                 if getattr(module, "_zero_init", False):
                     nn.init.zeros_(module.weight)
                 else:
-                    # Orthogonal init: produces well-conditioned weight matrices
-                    # whose singular values are all 1.  This gives the model a
-                    # better starting point — gradients flow more uniformly
-                    # through orthogonal matrices, so early training steps are
-                    # more informative, which matters when you only get ~12k
-                    # steps in the 10-minute budget.
                     nn.init.orthogonal_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -996,6 +906,70 @@ class GPT(nn.Module):
 # TRAINING
 # -----------------------------
 
+def ttt_adapt(args, base_model, device, val_tokens, rank=0, world_size=1, log_fn=None):
+    """Full-weight TTT: SGD adaptation on val data with DDP."""
+    seq_len = args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
+    batch_seqs = args.ttt_batch_seqs
+    distributed = world_size > 1
+
+    if args.ttt_freeze_blocks > 0:
+        for i, block in enumerate(base_model.blocks):
+            if i < args.ttt_freeze_blocks:
+                for p in block.parameters():
+                    p.requires_grad_(False)
+
+    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+
+    my_start = (total_seqs * rank) // world_size
+    my_end = (total_seqs * (rank + 1)) // world_size
+
+    base_model.train()
+    t0 = time.perf_counter()
+
+    for epoch in range(args.ttt_epochs):
+        epoch_loss = torch.zeros((), device=device, dtype=torch.float64)
+        epoch_tokens = torch.zeros((), device=device, dtype=torch.float64)
+
+        for batch_start in range(my_start, my_end, batch_seqs):
+            batch_end = min(batch_start + batch_seqs, my_end)
+            raw_start = batch_start * seq_len
+            raw_end = batch_end * seq_len + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = base_model(x, y)
+            loss.backward()
+
+            if distributed:
+                for p in ttt_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+            torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
+            optimizer.step()
+
+            epoch_loss += loss.detach().to(torch.float64) * y.numel()
+            epoch_tokens += float(y.numel())
+
+        if distributed:
+            dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(epoch_tokens, op=dist.ReduceOp.SUM)
+
+        if log_fn:
+            log_fn(f"ttt_epoch:{epoch+1}/{args.ttt_epochs} loss:{epoch_loss.item()/max(epoch_tokens.item(),1):.4f} time:{time.perf_counter()-t0:.1f}s")
+
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+    base_model.eval()
+    if log_fn:
+        log_fn(f"ttt:done elapsed={time.perf_counter()-t0:.1f}s")
+
+
 def main() -> None:
     global zeropower_via_newtonschulz5
 
@@ -1003,9 +977,7 @@ def main() -> None:
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
-    # -----------------------------
-    # DISTRIBUTED + CUDA SETUP
-    # -----------------------------
+    # --- DISTRIBUTED + CUDA ---
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1026,7 +998,6 @@ def main() -> None:
         dist.barrier()
     master_process = rank == 0
 
-    # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
@@ -1061,9 +1032,7 @@ def main() -> None:
     )
     log0("=" * 100, console=False)
 
-    # -----------------------------
-    # TOKENIZER + VALIDATION METRIC SETUP
-    # -----------------------------
+    # --- TOKENIZER + VALIDATION ---
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1087,9 +1056,7 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
-    # -----------------------------
-    # MODEL + OPTIMIZER SETUP
-    # -----------------------------
+    # --- MODEL + OPTIMIZER ---
 
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -1107,6 +1074,8 @@ def main() -> None:
         bigram_hash_dim=args.bigram_hash_dim,
         use_smeargate=args.use_smeargate,
         xsa_last_n=args.xsa_last_n,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1115,11 +1084,6 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -1134,16 +1098,15 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    # Collect embedding-like params
     embed_params = [base_model.tok_emb.weight]
     if base_model.bigram_hash is not None:
         embed_params.append(base_model.bigram_hash.table.weight)
-        # bigram_hash.proj is a CastedLinear — its weight goes to Muon
         matrix_params.append(base_model.bigram_hash.proj.weight)
     optimizer_tok = torch.optim.Adam(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_weight_decay,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1155,13 +1118,13 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    # SmearGate gate is a 1D parameter → goes to scalar optimizer
     if base_model.smeargate is not None:
         scalar_params.append(base_model.smeargate.gate)
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1191,9 +1154,7 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
-    # -----------------------------
-    # DATA LOADER & MODEL WARMUP
-    # -----------------------------
+    # --- DATA LOADER & WARMUP ---
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
@@ -1214,8 +1175,6 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
-    # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1242,13 +1201,10 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # -----------------------------
-    # MAIN TRAINING LOOP
-    # -----------------------------
+    # --- TRAINING LOOP ---
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    # EMA: maintain exponential moving average of all parameters
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1290,6 +1246,9 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        if args.late_qat and scale < args.qat_threshold and not CastedLinear._qat_enabled:
+            CastedLinear._qat_enabled = True
+            log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1335,7 +1294,6 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
-        # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
@@ -1349,17 +1307,12 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # -----------------------------
-    # SERIALIZATION + ROUNDTRIP VALIDATION
-    # -----------------------------
+    # --- SERIALIZATION + ROUNDTRIP ---
     # Apply EMA weights for final model.
     log0("EMA: applying exponential moving average weights")
     ema_sd = {name: t.to(dtype=base_model.state_dict()[name].dtype) for name, t in ema_state.items()}
     base_model.load_state_dict(ema_sd, strict=True)
     del ema_state, ema_sd
-
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1406,6 +1359,8 @@ def main() -> None:
         quant_decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(quant_decompressed), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    if args.ttt_enabled:
+        ttt_adapt(args, base_model, device, val_tokens, rank=rank, world_size=world_size, log_fn=log0)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
