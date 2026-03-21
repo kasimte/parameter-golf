@@ -106,7 +106,7 @@ class Hyperparameters:
     adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.04))
 
     # BigramHash: inject token-pair context via a hash-table embedding.
-    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 2048))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
 
     # SmearGate: blend each token's embedding with the previous token's
@@ -627,11 +627,11 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         x_rope, x_pass = x[..., :rd], x[..., rd:]
         half = rd // 2
         x1, x2 = x_rope[..., :half], x_rope[..., half:]
-        x_rot = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+        x_rot = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
         return torch.cat((x_rot, x_pass), dim=-1)
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -1102,7 +1102,7 @@ def main() -> None:
     if base_model.bigram_hash is not None:
         embed_params.append(base_model.bigram_hash.table.weight)
         matrix_params.append(base_model.bigram_hash.proj.weight)
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
@@ -1120,7 +1120,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     if base_model.smeargate is not None:
         scalar_params.append(base_model.smeargate.gate)
-    optimizer_scalar = torch.optim.Adam(
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
