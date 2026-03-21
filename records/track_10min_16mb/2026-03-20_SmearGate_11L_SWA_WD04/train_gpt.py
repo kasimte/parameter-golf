@@ -65,7 +65,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -83,10 +83,10 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.030))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.020))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.020))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
@@ -95,14 +95,16 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
-    # SWA: accumulate sparse weight snapshots during warmdown.
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.5))
-    swa_every = int(os.environ.get("SWA_EVERY", 200))
+    # EMA: exponential moving average of weights (replaces SWA).
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+
+    # XSA: exclusive self-attention on last N layers (0 = disabled).
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
 
     # BigramHash: inject token-pair context via a hash-table embedding.
-    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 2048))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
 
     # SmearGate: blend each token's embedding with the previous token's
@@ -739,6 +741,18 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_xsa = False
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        """Subtract self-value projection via GQA-aware reshape (no repeat_interleave).
+        y: (B, H, T, D), v: (B, Hkv, T, D) — both in (B, H, T, D) layout."""
+        B, H, T, D = y.shape
+        Hkv = v.size(1)
+        group = H // Hkv
+        y_g = y.reshape(B, Hkv, group, T, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(2)  # (B, Hkv, 1, T, D)
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, H, T, D)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -759,6 +773,8 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -865,6 +881,7 @@ class GPT(nn.Module):
         bigram_hash_buckets: int = 0,
         bigram_hash_dim: int = 128,
         use_smeargate: bool = True,
+        xsa_last_n: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -897,6 +914,10 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
+        # Enable XSA on last N layers
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -1085,6 +1106,7 @@ def main() -> None:
         bigram_hash_buckets=args.bigram_hash_buckets,
         bigram_hash_dim=args.bigram_hash_dim,
         use_smeargate=args.use_smeargate,
+        xsa_last_n=args.xsa_last_n,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1226,9 +1248,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    swa_state: dict[str, Tensor] | None = None
-    swa_count = 0
-    swa_step_counter = 0
+    # EMA: maintain exponential moving average of all parameters
+    ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1296,19 +1317,11 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # SWA: accumulate sparse weight snapshots during warmdown
-        if args.swa_start_frac > 0 and scale < args.swa_start_frac:
-            if swa_state is None:
-                # Capture first snapshot immediately when SWA window opens
-                swa_state = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
-                swa_count = 1
-                swa_step_counter = 0
-            else:
-                swa_step_counter += 1
-                if swa_step_counter % args.swa_every == 0:
-                    for k, v in base_model.state_dict().items():
-                        swa_state[k].add_(v.detach())
-                    swa_count += 1
+        # EMA: update exponential moving average every step
+        with torch.no_grad():
+            d = args.ema_decay
+            for name, t in base_model.state_dict().items():
+                ema_state[name].mul_(d).add_(t.detach().float(), alpha=1.0 - d)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1339,14 +1352,11 @@ def main() -> None:
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
-    # Apply SWA averaged weights if available.
-    if args.swa_start_frac > 0 and swa_count == 0:
-        log0("WARNING: SWA enabled but no checkpoints collected (training may have been too short for warmdown)")
-    if swa_state is not None and swa_count > 1:
-        log0(f"SWA: applying averaged weights from {swa_count} checkpoints")
-        for k in swa_state:
-            swa_state[k].div_(swa_count)
-        base_model.load_state_dict(swa_state, strict=True)
+    # Apply EMA weights for final model.
+    log0("EMA: applying exponential moving average weights")
+    ema_sd = {name: t.to(dtype=base_model.state_dict()[name].dtype) for name, t in ema_state.items()}
+    base_model.load_state_dict(ema_sd, strict=True)
+    del ema_state, ema_sd
 
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
