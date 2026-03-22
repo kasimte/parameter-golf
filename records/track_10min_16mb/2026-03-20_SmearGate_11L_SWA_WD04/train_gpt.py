@@ -79,8 +79,16 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
-    # EMA: exponential moving average of weights (replaces SWA).
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    # Tight SWA: collect checkpoints only in final warmdown (scale<0.2).
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.2))
+    swa_every = int(os.environ.get("SWA_EVERY", 50))
+
+    # Memory Tokens: learnable embeddings prepended to each sequence.
+    num_memory_tokens = int(os.environ.get("NUM_MEMORY_TOKENS", 64))
+
+    # Backout Connection: learned subtraction of mid-layer hidden state.
+    backout_enabled = bool(int(os.environ.get("BACKOUT_ENABLED", "1")))
+    backout_lambda_init = float(os.environ.get("BACKOUT_LAMBDA_INIT", 0.2))
 
     # XSA: exclusive self-attention on last N layers (0 = disabled).
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
@@ -796,6 +804,9 @@ class GPT(nn.Module):
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
+        num_memory_tokens: int = 0,
+        backout_enabled: bool = False,
+        backout_lambda_init: float = 0.2,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -806,6 +817,13 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash = BigramHash(bigram_hash_buckets, bigram_hash_dim, model_dim) if bigram_hash_buckets > 0 else None
         self.smeargate = SmearGate(model_dim) if use_smeargate else None
+        # Memory tokens: learnable embeddings prepended to each sequence
+        self.num_memory_tokens = num_memory_tokens
+        self.memory_tokens = nn.Parameter(torch.randn(num_memory_tokens, model_dim) * 0.02) if num_memory_tokens > 0 else None
+        # Backout connection: learned subtraction of mid-layer hidden state
+        self.backout_enabled = backout_enabled
+        self.backout_lambda = nn.Parameter(torch.tensor(backout_lambda_init, dtype=torch.float32)) if backout_enabled else None
+        self.mid_layer_idx = num_layers // 2
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -846,14 +864,20 @@ class GPT(nn.Module):
                     nn.init.orthogonal_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        bsz, seq_len = input_ids.shape
         x = self.tok_emb(input_ids)
         if self.bigram_hash is not None:
             x = x + self.bigram_hash(input_ids)
         if self.smeargate is not None:
             x = self.smeargate(x)
+        # Prepend memory tokens
+        if self.memory_tokens is not None:
+            mem = self.memory_tokens.to(dtype=x.dtype).unsqueeze(0).expand(bsz, -1, -1)
+            x = torch.cat([mem, x], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        h_mid: Tensor | None = None
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
@@ -863,6 +887,16 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+            if self.backout_enabled and (self.num_encoder_layers + i) == self.mid_layer_idx:
+                h_mid = x
+
+        # Backout: subtract mid-layer hidden state
+        if self.backout_enabled and h_mid is not None:
+            x = x - self.backout_lambda.to(dtype=x.dtype) * h_mid
+
+        # Strip memory tokens before computing loss
+        if self.memory_tokens is not None:
+            x = x[:, self.num_memory_tokens:, :]
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -877,14 +911,19 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits without computing loss. Used for sliding window eval."""
+        bsz = input_ids.size(0)
         x = self.tok_emb(input_ids)
         if self.bigram_hash is not None:
             x = x + self.bigram_hash(input_ids)
         if self.smeargate is not None:
             x = self.smeargate(x)
+        if self.memory_tokens is not None:
+            mem = self.memory_tokens.to(dtype=x.dtype).unsqueeze(0).expand(bsz, -1, -1)
+            x = torch.cat([mem, x], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        h_mid: Tensor | None = None
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
@@ -892,6 +931,12 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+            if self.backout_enabled and (self.num_encoder_layers + i) == self.mid_layer_idx:
+                h_mid = x
+        if self.backout_enabled and h_mid is not None:
+            x = x - self.backout_lambda.to(dtype=x.dtype) * h_mid
+        if self.memory_tokens is not None:
+            x = x[:, self.num_memory_tokens:, :]
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight.to(x.dtype))
@@ -1076,6 +1121,9 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
+        num_memory_tokens=args.num_memory_tokens,
+        backout_enabled=args.backout_enabled,
+        backout_lambda_init=args.backout_lambda_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1102,6 +1150,8 @@ def main() -> None:
     if base_model.bigram_hash is not None:
         embed_params.append(base_model.bigram_hash.table.weight)
         matrix_params.append(base_model.bigram_hash.proj.weight)
+    if base_model.memory_tokens is not None:
+        embed_params.append(base_model.memory_tokens)
     optimizer_tok = torch.optim.AdamW(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1120,6 +1170,8 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
     if base_model.smeargate is not None:
         scalar_params.append(base_model.smeargate.gate)
+    if base_model.backout_lambda is not None:
+        scalar_params.append(base_model.backout_lambda)
     optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -1205,7 +1257,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1276,11 +1329,15 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # EMA: update exponential moving average every step
-        with torch.no_grad():
-            d = args.ema_decay
-            for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(d).add_(t.detach().float(), alpha=1.0 - d)
+        # Tight SWA: collect checkpoints only in final warmdown
+        if args.swa_start_frac > 0 and scale < args.swa_start_frac and step % args.swa_every == 0:
+            if swa_state is None:
+                swa_state = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
+                swa_count = 1
+            else:
+                for k, v in base_model.state_dict().items():
+                    swa_state[k].add_(v.detach())
+                swa_count += 1
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1308,11 +1365,15 @@ def main() -> None:
     )
 
     # --- SERIALIZATION + ROUNDTRIP ---
-    # Apply EMA weights for final model.
-    log0("EMA: applying exponential moving average weights")
-    ema_sd = {name: t.to(dtype=base_model.state_dict()[name].dtype) for name, t in ema_state.items()}
-    base_model.load_state_dict(ema_sd, strict=True)
-    del ema_state, ema_sd
+    # Apply Tight SWA averaged weights if available.
+    if swa_state is not None and swa_count > 1:
+        log0(f"SWA: applying averaged weights from {swa_count} checkpoints")
+        for k in swa_state:
+            swa_state[k].div_(swa_count)
+        base_model.load_state_dict(swa_state, strict=True)
+        del swa_state
+    elif swa_count <= 1:
+        log0(f"WARNING: SWA collected only {swa_count} checkpoint(s) — using final training weights")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
