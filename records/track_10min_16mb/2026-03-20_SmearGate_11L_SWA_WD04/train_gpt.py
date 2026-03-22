@@ -84,7 +84,7 @@ class Hyperparameters:
     swa_every = int(os.environ.get("SWA_EVERY", 50))
 
     # Memory Tokens: learnable embeddings prepended to each sequence.
-    num_memory_tokens = int(os.environ.get("NUM_MEMORY_TOKENS", 64))
+    num_memory_tokens = int(os.environ.get("NUM_MEMORY_TOKENS", 0))
 
     # Backout Connection: learned subtraction of mid-layer hidden state.
     backout_enabled = bool(int(os.environ.get("BACKOUT_ENABLED", "1")))
